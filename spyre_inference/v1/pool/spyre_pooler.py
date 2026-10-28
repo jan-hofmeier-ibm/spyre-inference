@@ -54,22 +54,17 @@ logger = init_logger(__name__)
 
 
 def _cpu_cast_if_needed(pooled_data, head_dtype):
-    """Host cast when a Spyre tensor's dtype differs. Same-dtype is a no-op.
-
-    On-device fp16↔fp32 is staggered garbage (torch-spyre#2971). Upstream
-    ``.to(head_dtype)`` then sees a CPU tensor and does not cast again.
-    """
+    """Cast when a tensor's dtype differs. Same-dtype is a no-op."""
     if head_dtype is None:
         return pooled_data
     sample = pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
     if (
         isinstance(sample, torch.Tensor)
-        and sample.device.type == "spyre"
         and sample.dtype != head_dtype
     ):
         if isinstance(pooled_data, list):
             pooled_data = torch.stack(pooled_data)
-        pooled_data = convert(pooled_data, "cpu").to(head_dtype)
+        pooled_data = pooled_data.to(head_dtype)
     return pooled_data
 
 

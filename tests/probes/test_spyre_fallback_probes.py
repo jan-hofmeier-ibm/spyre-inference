@@ -1111,14 +1111,6 @@ def _destagger_fp32_to_host(tensor):
     return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
-        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
-        "When this XPASS-es, MEAN can convert a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
     """Raw convert of a device fp32 sum."""
     from spyre_inference.custom_ops.utils import convert

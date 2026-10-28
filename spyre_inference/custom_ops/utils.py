@@ -74,14 +74,12 @@ def _convert_op_func(
             + f"and same dtype ({tensor.dtype}), should never happen!"
         )
 
-    # Spyre requires CPU for dtype changes
-    if tensor.device.type == "spyre" and tensor.dtype != target_dtype:
-        tensor = tensor.to(device="cpu")
-
-    if tensor.dtype != target_dtype:
+    if tensor.device.type != target_device.type and tensor.dtype != target_dtype:
+        # Cross-device and cross-dtype: convert dtype on source or target device directly
+        tensor = tensor.to(dtype=target_dtype, device=target_device)
+    elif tensor.dtype != target_dtype:
         tensor = tensor.to(dtype=target_dtype)
-
-    if tensor.device.type != target_device.type:
+    elif tensor.device.type != target_device.type:
         tensor = tensor.to(device=target_device)
 
     return tensor
