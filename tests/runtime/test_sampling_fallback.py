@@ -62,12 +62,14 @@ def test_greedy_falls_back_to_argmax(rows: int) -> None:
     assert torch.equal(greedy_sample(logits), logits.argmax(dim=-1))
 
 
-# The fallback draws the same fp32 Exp(1) noise from the same RNG calls as stock
-# vLLM, in log space, so with tie-free fp32 logits it picks the same tokens.
+# SpyreTopKTopPSampler uses Threefry noise for the Gumbel draw whenever
+# generators is empty (greedy excepted — it never reaches the noise path).
+# All random cases therefore differ from stock vLLM by design; only the
+# greedy path is still bit-exact.  See test_threefry_sampler.py for coverage.
 @pytest.mark.parametrize(
     "k,p,greedy",
-    [(None, None, True), (None, None, False), (50, None, False), (50, 0.8, False)],
-    ids=["greedy", "random", "topk", "topk_topp"],
+    [(None, None, True)],
+    ids=["greedy"],
 )
 @pytest.mark.parametrize("rows", [1, 8])
 def test_patched_sampler_matches_stock_tokens(
@@ -119,3 +121,124 @@ def test_fallback_seeded_requests_are_reproducible() -> None:
 
     a, b = draw(), draw()
     assert torch.equal(a[[0, 2]], b[[0, 2]])
+
+
+def test_spyre_sampler_mixed_batch_on_cpu() -> None:
+    """A mixed greedy/random batch: greedy rows are the argmax, all ids are in range."""
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    rows, vocab = 6, 1000
+    meta = _meta(rows, None, None)
+    meta.all_random = False  # type: ignore[misc]
+    temp = torch.full((rows,), 0.8)
+    temp[::2] = 0.0  # greedy rows
+    meta.temperature = temp  # type: ignore[misc]
+    logits = torch.randn(rows, vocab)
+
+    sampler_ = SpyreSampler()
+    out = sampler_(logits=logits.clone(), sampling_metadata=meta).sampled_token_ids
+
+    assert out.shape == (rows, 1) and out.dtype == torch.int32
+    assert torch.equal(out[::2, 0].long(), logits[::2].argmax(dim=-1))
+    assert ((out >= 0) & (out < vocab)).all()
+    assert sampler_._host_temperature is None, "host temperature must not outlive sample()"
+
+
+def test_spyre_sampler_greedy_sample_off_device_is_plain_argmax() -> None:
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    logits = torch.randn(4, 500)
+    logits[1, [3, 9]] = logits.max() + 1  # tie: the lowest index wins
+    assert torch.equal(SpyreSampler().greedy_sample(logits), logits.argmax(dim=-1))
+
+
+def _host_reason(**changes) -> str | None:
+    import dataclasses
+
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    md = dataclasses.replace(_meta(4, None, None), **changes)
+    return SpyreSampler()._host_reason(md)
+
+
+def test_plain_request_stays_on_device() -> None:
+    assert _host_reason() is None
+
+
+@pytest.mark.parametrize(
+    "changes,expected",
+    [
+        ({"generators": {0: torch.Generator().manual_seed(1)}}, "seeded request"),
+        ({"top_k": torch.full((4,), 5, dtype=torch.long)}, "top_k/top_p"),
+        ({"top_p": torch.full((4,), 0.9)}, "top_k/top_p"),
+        ({"no_penalties": False}, "penalties"),
+        ({"allowed_token_ids_mask": torch.zeros(4, 10, dtype=torch.bool)}, "allowed_token_ids"),
+        ({"bad_words_token_ids": {0: [[1]]}}, "bad_words"),
+        ({"max_num_logprobs": 1}, "logprobs"),
+        ({"max_num_logprobs": -1}, "logprobs"),
+        ({"logprob_token_ids": {0: [1, 2]}}, "logprobs"),
+    ],
+    ids=[
+        "seeded",
+        "top_k",
+        "top_p",
+        "penalties",
+        "allowed_token_ids",
+        "bad_words",
+        "logprobs",
+        "logprobs_full",
+        "logprob_token_ids",
+    ],
+)
+def test_unsupported_feature_goes_to_host(changes: dict, expected: str) -> None:
+    assert _host_reason(**changes) == expected
+
+
+def test_warmup_keeps_top_k_top_p_on_device_but_not_seeded() -> None:
+    import dataclasses
+
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    s = SpyreSampler()
+    s.warming_up = True
+    md = dataclasses.replace(_meta(4, 5, 0.9), generators={0: torch.Generator().manual_seed(1)})
+    assert s._host_reason(md) == "seeded request"
+    assert s._host_reason(_meta(4, 5, 0.9)) is None
+
+
+@pytest.mark.parametrize(
+    "name,attr,value",
+    [
+        ("MinTokensLogitsProcessor", "min_toks", {0: object()}),
+        ("LogitBiasLogitsProcessor", "biases", {0: {1: 2.0}}),
+        ("MinPLogitsProcessor", "min_p_count", 1),
+        ("SomePluginProcessor", None, None),
+    ],
+)
+def test_active_logits_processor_goes_to_host(name: str, attr: str | None, value) -> None:
+    import types
+
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    proc = type(name, (), {})()
+    if attr is not None:
+        setattr(proc, attr, value)
+    lp = types.SimpleNamespace(all=[proc])
+    md = _meta(4, None, None)
+    md.logitsprocs = lp  # type: ignore[misc]
+    assert SpyreSampler()._host_reason(md) == f"logits processor {name}"
+
+
+def test_idle_builtin_logits_processors_stay_on_device() -> None:
+    import types
+
+    from spyre_inference.v1.sample.sampler import SpyreSampler
+
+    idle = [
+        type("MinTokensLogitsProcessor", (), {"min_toks": {}})(),
+        type("LogitBiasLogitsProcessor", (), {"biases": {}})(),
+        type("MinPLogitsProcessor", (), {"min_p_count": 0})(),
+    ]
+    md = _meta(4, None, None)
+    md.logitsprocs = types.SimpleNamespace(all=idle)  # type: ignore[misc]
+    assert SpyreSampler()._host_reason(md) is None

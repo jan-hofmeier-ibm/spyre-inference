@@ -27,23 +27,19 @@ from .vocab_parallel_embedding import promote_tied_lm_head
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
-        """Project through the lm_head, then D2H the logits on the single-card path.
+        """Project through the lm_head; logits stay on Spyre for TP=1.
 
-        The head's ``SpyreUnquantizedLMHeadMethod.apply`` returns logits on Spyre so the
-        TP all_gather in ``_gather_logits`` (which also D2Hs) can run on-device.
-        Upstream only calls ``_gather_logits`` when ``tp_size > 1``, so with a
-        single card the logits would otherwise stay on Spyre and the sampler's
-        ``logits.to(torch.float32)`` crashes torch-spyre's ``copy_from_d2d``.
-        Move them to CPU here so downstream sampling always gets CPU logits.
+        The head's ``SpyreUnquantizedLMHeadMethod.apply`` returns fp16 logits on Spyre.
+        For TP>1 ``_gather_logits`` handles the all_gather and D2H. For TP=1 logits
+        stay on Spyre: ``logits.to(torch.float32)`` in ``Sampler.forward`` now works
+        via ``to_dtype_d2d`` (torch-spyre threefry-enablement branch), so the old
+        workaround D2H is no longer needed.
         """
         # A model may hand us its embedding table as the head; give it a padded `Wᵀ`
         # on the first call, where the head's identity is finally unambiguous.
         promote_tied_lm_head(lm_head)
 
-        logits = super()._apply_head(lm_head, hidden_states, embedding_bias)
-        if lm_head.tp_size <= 1:
-            logits = convert(logits, device="cpu")
-        return logits
+        return super()._apply_head(lm_head, hidden_states, embedding_bias)
 
     @maybe_compile
     def _all_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:

@@ -88,7 +88,7 @@ from spyre_inference.v1.pool.encoder_grid import (
     unpad_encoder_grid,
 )
 from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
-from spyre_inference.v1.sample.sampler import greedy_sample
+from spyre_inference.v1.sample.sampler import SpyreSampler
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_granularity import (
@@ -572,12 +572,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # via self._spyre_device regardless of self.device.
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, torch.device("cpu"))
-        # Patch upstream's Sampler in place, so every holder of it (e.g. the
-        # RejectionSampler) takes the host-side draws.
+        # Replace the upstream Sampler with SpyreSampler, which moves
+        # SamplingMetadata tensors to the logits device before every forward
+        # pass so that temperature, penalties, top-k/p etc. are on the same
+        # device as logits (Spyre).  SpyreSampler also overrides greedy_sample
+        # (a method), and the SpyreTopKTopPSampler is installed here, so
+        # RejectionSampler holders pick both up too.
+        self.sampler = SpyreSampler(self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel)
         self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
             self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
         )
-        self.sampler.greedy_sample = greedy_sample  # ty: ignore[invalid-assignment]
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
         # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
@@ -904,8 +908,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
             if widest_hidden_states is not None:
-                for rows in sorted(row_widths, reverse=True):
-                    self._dummy_sampler_run(widest_hidden_states[:rows])
+                # The dummy request sets top-k/top-p; keep it on the device so the
+                # kernels compile here (SpyreSampler sends real such requests to the host).
+                self.sampler.warming_up = True
+                try:
+                    for rows in sorted(row_widths, reverse=True):
+                        self._dummy_sampler_run(widest_hidden_states[:rows])
+                finally:
+                    self.sampler.warming_up = False
             self._warmup_multimodal_encoder()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
@@ -1588,6 +1598,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # (and any other non_blocking copies) before the runner consumes
         # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
         torch.spyre.synchronize(self._spyre_device)
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        # Upstream does ``pinned_int64.copy_(ids_int32_on_device)``. On Spyre that
+        # dtype-converting device-to-host copy returns zeros/garbage, so read the ids
+        # back in their own dtype first and widen on the host.
+        return sampled_token_ids.cpu().to(torch.int64).tolist()
 
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks
